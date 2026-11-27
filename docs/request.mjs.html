@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    
+    <meta charset="utf-8">
+    <title>request.mjs - Documentation</title>
+    
+    
+    <script src="scripts/prettify/prettify.js"></script>
+    <script src="scripts/prettify/lang-css.js"></script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc.css">
+    <script src="scripts/nav.js" defer></script>
+    
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+
+<input type="checkbox" id="nav-trigger" class="nav-trigger" />
+<label for="nav-trigger" class="navicon-button x">
+  <div class="navicon"></div>
+</label>
+
+<label for="nav-trigger" class="overlay"></label>
+
+<nav >
+    
+    
+    <h2><a href="index.html">Home</a></h2><h3>Global</h3><ul><li><a href="global.html#WDwdataDeribit">WDwdataDeribit</a></li><li><a href="global.html#aggregateTrades">aggregateTrades</a></li><li><a href="global.html#cellKeyOf">cellKeyOf</a></li><li><a href="global.html#classifyResult">classifyResult</a></li><li><a href="global.html#downloadTrades">downloadTrades</a></li><li><a href="global.html#downloadVolIndex">downloadVolIndex</a></li><li><a href="global.html#makeClient">makeClient</a></li><li><a href="global.html#normalizeTrade">normalizeTrade</a></li><li><a href="global.html#parseInstrument">parseInstrument</a></li><li><a href="global.html#readTrades">readTrades</a></li><li><a href="global.html#saveTrades">saveTrades</a></li><li><a href="global.html#saveVolIndex">saveVolIndex</a></li><li><a href="global.html#summarizeCells">summarizeCells</a></li><li><a href="global.html#summarizeRange">summarizeRange</a></li></ul>
+    
+</nav>
+
+<div id="main">
+    
+    <h1 class="page-title">request.mjs</h1>
+    
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>import axios from 'axios'
+import getOptReader from 'wsemi/src/getOptReader.mjs'
+import getTrace from 'wsemi/src/getTrace.mjs'
+import timers from './timers.mjs'
+import { readInt } from './opts.mjs'
+
+
+/**
+ * 將一次請求之結果分類(內部使用)。
+ * kind：'ok'(HTTP 2xx且回應有result)、'invalidResponse'(HTTP 2xx而無result，例如代理之HTML頁面)、'rateLimited'(429或錯誤代碼10028)、'maintenance'(503，交易所維護)、'badRequest'(400，參數有誤)、'httpError'(其餘之HTTP狀態，5xx重試，其餘不重試)、'timeout'(逾時)、'network'(連線錯誤等無回應)。
+ *
+ * @function classifyResult
+ * @param {Object} r - { status, json, err, aborted }，status為HTTP狀態(無回應時null)，json為解析後之回應本文(無法解析時null)，err為連線層錯誤，aborted為是否因逾時而中止
+ * @returns {Object} 回傳物件 { kind, httpStatus, code, retry }，code為回應內錯誤物件之數字代碼(無則null)，retry為是否重試
+ */
+let classifyResult = (r) => {
+    if (r.err) {
+        return { kind: r.aborted ? 'timeout' : 'network', httpStatus: null, code: null, retry: true }
+    }
+    let s = r.status
+    let j = r.json
+    let code = null
+    if (j &amp;&amp; j.error &amp;&amp; Number.isSafeInteger(j.error.code)) {
+        code = j.error.code
+    }
+    if (s === 429 || code === 10028) {
+        return { kind: 'rateLimited', httpStatus: s, code, retry: true }
+    }
+    if (s >= 200 &amp;&amp; s &lt; 300) {
+        if (j &amp;&amp; j.result !== undefined &amp;&amp; j.result !== null) {
+            return { kind: 'ok', httpStatus: s, code: null, retry: false }
+        }
+        return { kind: 'invalidResponse', httpStatus: s, code, retry: true }
+    }
+    if (s === 503) {
+        return { kind: 'maintenance', httpStatus: s, code, retry: true }
+    }
+    if (s === 400) {
+        return { kind: 'badRequest', httpStatus: s, code, retry: false }
+    }
+    return { kind: 'httpError', httpStatus: s, code, retry: s >= 500 }
+}
+
+
+/**
+ * 建立請求端(內部使用)：相鄰兩次請求之起始至少相隔minGapMs(同一請求端之並行呼叫共用此節流)；失敗時重試retryTimes次，第i次前等待timeRetry*3^(i-1)毫秒(不超過timeRetryMax)。
+ * 選項為執行參數：undefined與null視為未給(用預設)，給了而無效(非整數、Infinity、'0x10'、負數、超出範圍等)改用預設，不拋錯；整數類接受數字字串並轉為數值。opt.debug為true時另輸出警告(不含輸入值)。
+ * 觀察回調opt.onTrace(同步、凍結之事件、拋錯忽略)之事件：{ type: 'throttle', wait }(節流而等待)、{ type: 'attempt', attempt, kind, httpStatus }(每次請求後)、{ type: 'retry', attempt, wait, kind }(重試前之等待)。
+ *
+ * @function makeClient
+ * @param {Object} [opt={}] - 設定參數
+ * @param {Integer} [opt.minGapMs=220] - 相鄰兩次請求之起始最小間隔毫秒數(非負整數，上限2147483647)
+ * @param {Integer} [opt.retryTimes=3] - 請求失敗後之重試次數(非負整數)，0代表不重試
+ * @param {Integer} [opt.timeRetry=1000] - 重試之等待基數毫秒數(非負整數，上限2147483647)
+ * @param {Integer} [opt.timeRetryMax=60000] - 每次重試等待之上限毫秒數(非負整數，上限2147483647)
+ * @param {Integer} [opt.timeRequest=60000] - 單一請求之逾時毫秒數(正整數，上限2147483647，自送出至收完回應)
+ * @param {Function} [opt.onTrace] - 觀察回調
+ * @param {Object} [proxy] - 已檢測之axios proxy設定 { protocol, host, port, auth }，未給則依axios之預設(含環境變數)
+ * @returns {Object} 回傳物件 { getResult(url, params), stats, trace }，getResult resolve回應之result，失敗時reject Error(帶kind、httpStatus、code、attempts；訊息不帶網址與參數)，stats為 { requests }(累計送出之請求數)，trace為getTrace之通知函數(未給onTrace時為null，供同套件內其他模組送出事件)
+ */
+let makeClient = (opt = {}, proxy = undefined) => {
+    let rd = getOptReader('w-dwdata-deribit request', opt)
+    let minGapMs = readInt(rd, 'minGapMs', 220, { use: 'timer' }, 'an integer between 0 and 2147483647', '220')
+    let retryTimes = readInt(rd, 'retryTimes', 3, { use: 'count' }, 'a non-negative integer', '3')
+    let timeRetry = readInt(rd, 'timeRetry', 1000, { use: 'timer' }, 'an integer between 0 and 2147483647', '1000')
+    let timeRetryMax = readInt(rd, 'timeRetryMax', 60000, { use: 'timer' }, 'an integer between 0 and 2147483647', '60000')
+    let timeRequest = readInt(rd, 'timeRequest', 60000, { use: 'timer', min: 1 }, 'an integer between 1 and 2147483647', '60000')
+    let trace = getTrace({ onTrace: rd.read('onTrace') })
+    let stats = { requests: 0 }
+    let nextSlot = 0
+
+    //slot, 取得本次請求可起始之時刻, 未到則等待
+    let slot = async () => {
+        let now = timers.mono()
+        let at = Math.max(now, nextSlot)
+        nextSlot = at + minGapMs
+        if (at > now) {
+            if (trace) {
+                trace('throttle', { wait: at - now })
+            }
+            await timers.sleep(at - now)
+        }
+    }
+
+    //once, 送出一次GET; 自送出至收完回應超過timeRequest即中止, 任何HTTP狀態皆回傳而不拋
+    let once = async (url, params) => {
+        let ac = new AbortController()
+        let timer = timers.timeout(() => {
+            ac.abort()
+        }, timeRequest)
+        try {
+            let cfg = {
+                params,
+                headers: { Accept: 'application/json' },
+                responseType: 'text',
+                transformResponse: [(d) => d],
+                signal: ac.signal,
+                validateStatus: () => true,
+                maxRedirects: 0,
+            }
+            if (proxy) {
+                cfg.proxy = proxy
+            }
+            let r = await axios.get(url, cfg)
+            let json = null
+            try {
+                json = JSON.parse(r.data)
+            }
+            catch (err) {
+                json = null
+            }
+            return { status: r.status, json, err: null, aborted: false }
+        }
+        catch (err) {
+            return { status: null, json: null, err, aborted: ac.signal.aborted }
+        }
+        finally {
+            timers.cancel(timer)
+        }
+    }
+
+    let getResult = async (url, params) => {
+        let i = 0
+        while (true) {
+            await slot()
+            stats.requests++
+            let r = await once(url, params)
+            let c = classifyResult(r)
+            if (trace) {
+                trace('attempt', { attempt: i + 1, kind: c.kind, httpStatus: c.httpStatus })
+            }
+            if (c.kind === 'ok') {
+                return r.json.result
+            }
+            if (!c.retry || i >= retryTimes) {
+                let e = new Error(`request failed: kind[${c.kind}] status[${c.httpStatus}] attempts[${i + 1}]`)
+                e.kind = c.kind
+                e.httpStatus = c.httpStatus
+                e.code = c.code
+                e.attempts = i + 1
+                throw e
+            }
+            i++
+            let w = Math.min(timeRetry * (3 ** (i - 1)), timeRetryMax)
+            if (trace) {
+                trace('retry', { attempt: i, wait: w, kind: c.kind })
+            }
+            await timers.sleep(w)
+        }
+    }
+
+    return { getResult, stats, trace }
+}
+
+
+export { classifyResult, makeClient }
+export default makeClient
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+    
+    
+</div>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 4.0.5</a> on Sat Nov 28 2026 00:12:26 GMT+0800 (台北標準時間) using the <a href="https://github.com/clenemt/docdash">docdash</a> theme.
+</footer>
+
+<script>prettyPrint();</script>
+<script src="scripts/polyfill.js"></script>
+<script src="scripts/linenumber.js"></script>
+
+
+
+</body>
+</html>

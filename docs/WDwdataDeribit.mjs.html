@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    
+    <meta charset="utf-8">
+    <title>WDwdataDeribit.mjs - Documentation</title>
+    
+    
+    <script src="scripts/prettify/prettify.js"></script>
+    <script src="scripts/prettify/lang-css.js"></script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc.css">
+    <script src="scripts/nav.js" defer></script>
+    
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+
+<input type="checkbox" id="nav-trigger" class="nav-trigger" />
+<label for="nav-trigger" class="navicon-button x">
+  <div class="navicon"></div>
+</label>
+
+<label for="nav-trigger" class="overlay"></label>
+
+<nav >
+    
+    
+    <h2><a href="index.html">Home</a></h2><h3>Global</h3><ul><li><a href="global.html#WDwdataDeribit">WDwdataDeribit</a></li><li><a href="global.html#aggregateTrades">aggregateTrades</a></li><li><a href="global.html#cellKeyOf">cellKeyOf</a></li><li><a href="global.html#classifyResult">classifyResult</a></li><li><a href="global.html#downloadTrades">downloadTrades</a></li><li><a href="global.html#downloadVolIndex">downloadVolIndex</a></li><li><a href="global.html#makeClient">makeClient</a></li><li><a href="global.html#normalizeTrade">normalizeTrade</a></li><li><a href="global.html#parseInstrument">parseInstrument</a></li><li><a href="global.html#readTrades">readTrades</a></li><li><a href="global.html#saveTrades">saveTrades</a></li><li><a href="global.html#saveVolIndex">saveVolIndex</a></li><li><a href="global.html#summarizeCells">summarizeCells</a></li><li><a href="global.html#summarizeRange">summarizeRange</a></li></ul>
+    
+</nav>
+
+<div id="main">
+    
+    <h1 class="page-title">WDwdataDeribit.mjs</h1>
+    
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>import getOptReader from 'wsemi/src/getOptReader.mjs'
+import { readHost, readProxy } from './opts.mjs'
+import { makeClient } from './request.mjs'
+import { parseInstrument, downloadTrades, saveTrades, readTrades } from './trades.mjs'
+import { aggregateTrades, summarizeCells } from './aggregate.mjs'
+import { downloadVolIndex, saveVolIndex } from './volIndex.mjs'
+
+
+/**
+ * 建立Deribit公開行情之下載器(不需金鑰，只送公開之查詢參數)：選擇權逐筆成交之每日檔、彙整為格與每日基本量、隱含波動指數。
+ * 同一下載器之並行呼叫共用同一個節流(相鄰兩次請求之起始至少相隔opt.minGapMs)，故可同時對不同日期範圍呼叫saveTrades。
+ *
+ * 選項檢測：決定下載來源與網路出口者(hostHistory、hostLive、proxy)給了而無效即拋(訊息為'invalid opt.&lt;名稱>: must be &lt;種類>'，不帶輸入值)，不改用預設；
+ * 其餘為執行參數(minGapMs、retryTimes、timeRetry、timeRetryMax、timeRequest)，undefined與null視為未給(用預設)，給了而無效改用預設，不拋錯，opt.debug為true時另輸出警告(不含輸入值)，整數類接受數字字串並轉為數值。
+ *
+ * @function WDwdataDeribit
+ * @param {Object} [opt={}] - 設定參數
+ * @param {String} [opt.hostHistory='https://history.deribit.com'] - 歷史成交之主機(涵蓋全部期間含最近2小時)，須為http(s)網址且不帶帳密、查詢與片段
+ * @param {String} [opt.hostLive='https://www.deribit.com'] - 波動指數之主機(歷史主機無此端點)，限制同hostHistory
+ * @param {Object} [opt.proxy] - 代理伺服器設定，符合axios proxy格式 { protocol, host, port, auth }，未給則依axios之預設(含環境變數)
+ * @param {Integer} [opt.minGapMs=220] - 相鄰兩次請求之起始最小間隔毫秒數(非負整數，上限2147483647)
+ * @param {Integer} [opt.retryTimes=3] - 請求失敗後之重試次數(非負整數)，0代表不重試
+ * @param {Integer} [opt.timeRetry=1000] - 第i次重試前等待timeRetry*3^(i-1)毫秒(預設1、3、9秒；非負整數，上限2147483647)，每次等待不超過timeRetryMax
+ * @param {Integer} [opt.timeRetryMax=60000] - 每次重試等待之上限毫秒數(非負整數，上限2147483647)
+ * @param {Integer} [opt.timeRequest=60000] - 單一請求之逾時毫秒數(正整數，上限2147483647，自送出至收完回應)
+ * @param {Function} [opt.onTrace] - 觀察回調(同步、凍結之事件、拋錯與回傳之rejection皆忽略)，事件：{ type: 'throttle', wait }(節流而等待)、{ type: 'attempt', attempt, kind, httpStatus }(每次請求後)、{ type: 'retry', attempt, wait, kind }(重試前之等待)、{ type: 'day', day, state, n, kind }(saveTrades處理完一日，state為'skipped'、'saved'、'failed'、'notRequested')、{ type: 'halt', day, reason }(saveTrades停止本次執行之後續請求)
+ * @param {Boolean} [opt.debug=false] - 是否於非預期之選項改用預設時輸出警告
+ * @param {Function} [opt.funLog] - 警告之輸出函數，未給則為console.warn
+ * @returns {Object} 回傳物件 { downloadTrades, saveTrades, readTrades, summarizeRange, aggregateTrades, summarizeCells, parseInstrument, downloadVolIndex, saveVolIndex, stats }，stats為 { requests }(本下載器累計送出之請求數)
+ * @example
+ *
+ * import WDwdataDeribit from 'w-dwdata-deribit'
+ *
+ * async function test() {
+ *
+ *     //wdd
+ *     let wdd = WDwdataDeribit()
+ *
+ *     //下載ETH選擇權之逐筆成交至每日檔(UTC日, 已有檔之日不重抓)
+ *     let r = await wdd.saveTrades('ETH', 'option', './data/ETH/option', '2024-02-29', { dayEnd: '2024-03-01' })
+ *     console.log(r.saved.map((v) => [v.day, v.n]))
+ *
+ *     //以使用端之日界(台北2024-03-01 = [02-29T16:00Z, 03-01T16:00Z))取用: 讀檔 → 格 → 基本量
+ *     let tStart = Date.parse('2024-02-29T16:00:00Z')
+ *     let s = wdd.summarizeRange('./data/ETH/option', tStart, tStart + 86400000)
+ *     console.log(s.complete, s.n, s.summary.pcr)
+ *
+ * }
+ * test()
+ * // => [ [ '2024-02-29', &lt;筆數> ], [ '2024-03-01', &lt;筆數> ] ]
+ * // => true &lt;入格之筆數> &lt;賣權口數比>
+ *
+ */
+let WDwdataDeribit = (opt = {}) => {
+    let rd = getOptReader('w-dwdata-deribit', opt)
+    let hostHistory = readHost(rd, 'hostHistory', 'https://history.deribit.com')
+    let hostLive = readHost(rd, 'hostLive', 'https://www.deribit.com')
+    let proxy = readProxy(rd)
+    let client = makeClient(opt, proxy)
+
+    /**
+     * 以使用端之日界取用：[tStart, tEnd)內之成交(自每日檔) → 格 → 基本量；範圍內有尚未下載之UTC日者complete為false。
+     *
+     * @function summarizeRange
+     * @param {String} fdTrades - 每日檔之資料夾
+     * @param {Integer} tStart - 起(含)毫秒時間戳
+     * @param {Integer} tEnd - 迄(不含)毫秒時間戳，須大於起
+     * @param {Object} [optAgg={}] - 彙整之口徑選項，見aggregateTrades
+     * @returns {Object} 回傳物件 { complete, missingDays, n, skipped, cells, summary }，n、skipped、cells見aggregateTrades，summary見summarizeCells
+     */
+    let summarizeRange = (fdTrades, tStart, tEnd, optAgg = {}) => {
+        let r = readTrades(fdTrades, tStart, tEnd)
+        let g = aggregateTrades(r.trades, optAgg)
+        return { complete: r.missingDays.length === 0, missingDays: r.missingDays, n: g.n, skipped: g.skipped, cells: g.cells, summary: summarizeCells(g.cells) }
+    }
+
+    return {
+        downloadTrades: (currency, kind, tStart, tEnd, opt) => downloadTrades(client, hostHistory, currency, kind, tStart, tEnd, opt),
+        saveTrades: (currency, kind, fdTrades, dayStart, opt) => saveTrades(client, hostHistory, currency, kind, fdTrades, dayStart, opt),
+        readTrades,
+        summarizeRange,
+        aggregateTrades,
+        summarizeCells,
+        parseInstrument,
+        downloadVolIndex: (currency, tStart, tEnd, opt) => downloadVolIndex(client, hostLive, currency, tStart, tEnd, opt),
+        saveVolIndex: (currency, fp, tStart, tEnd, opt) => saveVolIndex(client, hostLive, currency, fp, tStart, tEnd, opt),
+        stats: client.stats,
+    }
+}
+
+
+export default WDwdataDeribit
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+    
+    
+</div>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 4.0.5</a> on Sat Nov 28 2026 00:12:26 GMT+0800 (台北標準時間) using the <a href="https://github.com/clenemt/docdash">docdash</a> theme.
+</footer>
+
+<script>prettyPrint();</script>
+<script src="scripts/polyfill.js"></script>
+<script src="scripts/linenumber.js"></script>
+
+
+
+</body>
+</html>

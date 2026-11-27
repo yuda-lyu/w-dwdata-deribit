@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    
+    <meta charset="utf-8">
+    <title>volIndex.mjs - Documentation</title>
+    
+    
+    <script src="scripts/prettify/prettify.js"></script>
+    <script src="scripts/prettify/lang-css.js"></script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc.css">
+    <script src="scripts/nav.js" defer></script>
+    
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+
+<input type="checkbox" id="nav-trigger" class="nav-trigger" />
+<label for="nav-trigger" class="navicon-button x">
+  <div class="navicon"></div>
+</label>
+
+<label for="nav-trigger" class="overlay"></label>
+
+<nav >
+    
+    
+    <h2><a href="index.html">Home</a></h2><h3>Global</h3><ul><li><a href="global.html#WDwdataDeribit">WDwdataDeribit</a></li><li><a href="global.html#aggregateTrades">aggregateTrades</a></li><li><a href="global.html#cellKeyOf">cellKeyOf</a></li><li><a href="global.html#classifyResult">classifyResult</a></li><li><a href="global.html#downloadTrades">downloadTrades</a></li><li><a href="global.html#downloadVolIndex">downloadVolIndex</a></li><li><a href="global.html#makeClient">makeClient</a></li><li><a href="global.html#normalizeTrade">normalizeTrade</a></li><li><a href="global.html#parseInstrument">parseInstrument</a></li><li><a href="global.html#readTrades">readTrades</a></li><li><a href="global.html#saveTrades">saveTrades</a></li><li><a href="global.html#saveVolIndex">saveVolIndex</a></li><li><a href="global.html#summarizeCells">summarizeCells</a></li><li><a href="global.html#summarizeRange">summarizeRange</a></li></ul>
+    
+</nav>
+
+<div id="main">
+    
+    <h1 class="page-title">volIndex.mjs</h1>
+    
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>import fs from 'fs'
+import path from 'path'
+import getOptReader from 'wsemi/src/getOptReader.mjs'
+import iseint from 'wsemi/src/iseint.mjs'
+import { needStr, needRange, readStrict, toNum } from './opts.mjs'
+
+
+const API_VOL = '/api/v2/public/get_volatility_index_data'
+
+
+//isResolution, 解析度: 秒數(正整數, 數字或數字字串)或'1D'(交易所實際支援之值以其回應為準, 不支援者回400)
+let isResolution = (v) => v === '1D' || iseint(v, { use: 'safe', min: 1 })
+
+
+//readResolution, opt.resolution: 決定資料之取樣間隔, 給了而無效即拋
+let readResolution = (rd) => {
+    let v = readStrict(rd, 'resolution', 3600, isResolution, 'a positive integer in seconds or 1D')
+    return v === '1D' ? v : String(toNum(v))
+}
+
+
+/**
+ * 下載[tStart, tEnd)(毫秒，半開區間，同downloadTrades與readTrades)之隱含波動指數(DVOL)：每次回應之continuation為其前仍有資料之時刻，以之為下一次之迄，直到無continuation；依時刻去重並遞增排序，回應內範圍外之點(含恰在tEnd之點)濾除。
+ * 送交易所之end_timestamp仍為tEnd(其迄為含，已實連驗證此請求形式；不改送tEnd - 1以免依賴未驗證之邊界行為)，故回應可能含恰在tEnd之點，於本端濾除；相鄰兩區間[a, b)與[b, c)之結果相接，不重複、不遺漏。
+ * 資料只在即時主機(歷史主機無此端點)，ETH自2021-03-24起。
+ *
+ * @async
+ * @function downloadVolIndex
+ * @param {Object} client - makeClient之回傳
+ * @param {String} host - 即時主機，例如'https://www.deribit.com'
+ * @param {String} currency - 幣別，例如'ETH'
+ * @param {Integer} tStart - 起(含)毫秒時間戳
+ * @param {Integer} tEnd - 迄(不含)毫秒時間戳，須大於起
+ * @param {Object} [opt={}] - 設定參數
+ * @param {Integer|String} [opt.resolution=3600] - 解析度：秒數(正整數，如1、60、3600、43200)或'1D'，給了而無效即拋(決定取樣間隔，不改用預設)
+ * @returns {Promise} resolve回傳 [[時刻毫秒, 開, 高, 低, 收], …](時刻遞增、不重複)
+ */
+let downloadVolIndex = async (client, host, currency, tStart, tEnd, opt = {}) => {
+    needStr('currency', currency)
+    let [a, b] = needRange('tStart', tStart, 'tEnd', tEnd)
+    let rd = getOptReader('w-dwdata-deribit downloadVolIndex', opt)
+    let resolution = readResolution(rd)
+    let pts = new Map()
+    let end = b
+    while (true) {
+        let res = await client.getResult(`${host}${API_VOL}`, { currency, start_timestamp: a, end_timestamp: end, resolution })
+        if (!res || !Array.isArray(res.data)) {
+            let e = new Error('request failed: kind[invalidResponse] status[200] attempts[1]')
+            e.kind = 'invalidResponse'
+            e.httpStatus = 200
+            e.code = null
+            e.attempts = 1
+            throw e
+        }
+        for (let p of res.data) {
+            if (Array.isArray(p) &amp;&amp; p[0] >= a &amp;&amp; p[0] &lt; b) {
+                pts.set(p[0], p)
+            }
+        }
+        if (!res.continuation || res.data.length === 0 || res.continuation >= end) {
+            break
+        }
+        end = res.continuation
+    }
+    return [...pts.values()].sort((p, q) => p[0] - q[0])
+}
+
+
+/**
+ * 下載並存成CSV(欄：ts,open,high,low,close；區間為半開[tStart, tEnd)，見downloadVolIndex；先寫暫存檔再改名；整檔重寫，範圍內無資料時為只有欄名之檔)。
+ *
+ * @async
+ * @function saveVolIndex
+ * @param {Object} client - makeClient之回傳
+ * @param {String} host - 即時主機
+ * @param {String} currency - 幣別，例如'ETH'
+ * @param {String} fp - 輸出之CSV檔路徑
+ * @param {Integer} tStart - 起(含)毫秒時間戳
+ * @param {Integer} tEnd - 迄(不含)毫秒時間戳，須大於起
+ * @param {Object} [opt={}] - 設定參數，見downloadVolIndex
+ * @returns {Promise} resolve回傳 { n(點數), from, to }，from、to為首末點之ISO時刻字串(無資料時為null)
+ */
+let saveVolIndex = async (client, host, currency, fp, tStart, tEnd, opt = {}) => {
+    needStr('currency', currency)
+    needStr('fp', fp)
+    needRange('tStart', tStart, 'tEnd', tEnd)
+    let data = await downloadVolIndex(client, host, currency, tStart, tEnd, opt)
+    fs.mkdirSync(path.dirname(fp), { recursive: true })
+    let tmp = `${fp}.${process.pid}.tmp`
+    try {
+        fs.writeFileSync(tmp, ['ts,open,high,low,close', ...data.map((p) => p.slice(0, 5).join(','))].join('\n') + '\n', 'utf8')
+        fs.renameSync(tmp, fp)
+    }
+    catch (err) {
+        try {
+            fs.unlinkSync(tmp)
+        }
+        catch (e) {
+            //暫存檔不存在
+        }
+        throw err
+    }
+    return { n: data.length, from: data.length ? new Date(data[0][0]).toISOString() : null, to: data.length ? new Date(data[data.length - 1][0]).toISOString() : null }
+}
+
+
+export { downloadVolIndex, saveVolIndex }
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+    
+    
+</div>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 4.0.5</a> on Sat Nov 28 2026 00:12:26 GMT+0800 (台北標準時間) using the <a href="https://github.com/clenemt/docdash">docdash</a> theme.
+</footer>
+
+<script>prettyPrint();</script>
+<script src="scripts/polyfill.js"></script>
+<script src="scripts/linenumber.js"></script>
+
+
+
+</body>
+</html>

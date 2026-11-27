@@ -1,0 +1,12 @@
+node_modules
+.agents
+.opencode
+.claude
+CLAUDE*.md
+AGENTS*.md
+.env
+
+tmp
+test/_tmp
+
+data
